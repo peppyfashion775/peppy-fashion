@@ -4720,6 +4720,11 @@ function doPost(e) {
     if (action === "createstoreReceiptPdf".toLowerCase()) { return successResponse(createStoreReceiptPdf(data)); }
     if (action === "createstoreReportPdf".toLowerCase()) { return successResponse(createStoreReportPdf(data)); }
 
+    if (action === "getmarketingcampaigns") { return successResponse(getMarketingCampaigns(data)); }
+    if (action === "createmarketingcampaign") { return successResponse(createMarketingCampaign(data)); }
+    if (action === "sendmarketingcampaign") { return successResponse(sendMarketingCampaign(data)); }
+    if (action === "setupmarketingautomation") { requireAdmin(data); return successResponse({message:setupMarketingAutomation()}); }
+
     /* -------------------------------------------------------------
        ADMIN ORDER
        ------------------------------------------------------------- */
@@ -4862,6 +4867,55 @@ function restoreStockForCancelledOrder_(orderId) {
   if (!Array.isArray(items)) throw new Error("Unable to restore stock: invalid stored order items.");
   adjustProductStockForOrder_(items, "restore");
   props.deleteProperty(getOrderStockKey_(orderId));
+}
+
+
+/* =================================================================
+   PEPPY FASHION — MARKETING AUTOMATION
+   ================================================================= */
+const MARKETING_CAMPAIGN_HEADERS = ["Campaign ID","Name","Type","Subject","Preheader","Body HTML","Audience","Discount Code","Start Date","End Date","Status","Created At","Last Run","Sent","Failed"];
+const MARKETING_LOG_HEADERS = ["Timestamp","Campaign ID","Email","Customer Name","Status","Error"];
+
+function getOrCreateMarketingSheet_(name, headers){
+  const ss=getSpreadsheet(); let sh=ss.getSheetByName(name);
+  if(!sh){sh=ss.insertSheet(name);sh.getRange(1,1,1,headers.length).setValues([headers]);}
+  return sh;
+}
+function marketingSheetObjects_(name,headers){
+  const sh=getOrCreateMarketingSheet_(name,headers), values=sh.getDataRange().getValues();
+  if(values.length<2)return [];
+  const h=values[0].map(v=>String(v).trim().toLowerCase());
+  return values.slice(1).map((r,i)=>{const o={rowNumber:i+2};headers.forEach(k=>{const idx=h.indexOf(k.toLowerCase());o[k]=idx>=0?r[idx]:"";});return o;});
+}
+function getMarketingCampaigns(data){requireAdmin(data);return {campaigns:marketingSheetObjects_("MarketingCampaigns",MARKETING_CAMPAIGN_HEADERS).map(marketingCampaignPublic_)};}
+function marketingCampaignPublic_(c){return {campaignId:String(c["Campaign ID"]||""),name:String(c.Name||""),type:String(c.Type||"Campaign"),subject:String(c.Subject||""),preheader:String(c.Preheader||""),bodyHtml:String(c["Body HTML"]||""),audience:String(c.Audience||"All Customers"),discountCode:String(c["Discount Code"]||""),startDate:c["Start Date"]||"",endDate:c["End Date"]||"",status:String(c.Status||"Draft"),createdAt:c["Created At"]||"",lastRun:c["Last Run"]||"",sent:Number(c.Sent||0),failed:Number(c.Failed||0)};}
+function createMarketingCampaign(data){
+  requireAdmin(data); const sh=getOrCreateMarketingSheet_("MarketingCampaigns",MARKETING_CAMPAIGN_HEADERS), id="CMP"+Utilities.formatDate(new Date(),Session.getScriptTimeZone(),"yyMMddHHmmss")+Math.floor(Math.random()*1000);
+  const now=new Date(); sh.appendRow([id,safeString(data.name)||"Untitled Campaign",safeString(data.type)||"Campaign",safeString(data.subject)||"Peppy Fashion",safeString(data.preheader),safeString(data.bodyHtml),safeString(data.audience)||"All Customers",safeString(data.discountCode),safeString(data.startDate),safeString(data.endDate),safeString(data.status)||"Scheduled",now,"",0,0]);
+  return {message:"Campaign created.",campaignId:id};
+}
+function getMarketingCustomers_(audience){
+  const orders=getAllOrders(), map=new Map(), now=new Date();
+  orders.forEach(o=>{const email=safeString(o.email).trim().toLowerCase();if(!email||email.indexOf("@")<1)return;const key=email; if(!map.has(key))map.set(key,{name:safeString(o.name)||"Customer",email:email,phone:safeString(o.phone),orders:0,total:0,last:o.date||""});const c=map.get(key);c.orders++;c.total+=safeNumber(o.total);if(new Date(o.date||0)>new Date(c.last||0))c.last=o.date;});
+  const all=Array.from(map.values()); const a=String(audience||"All Customers").toLowerCase();
+  return all.filter(c=>{if(a==="all customers")return true;if(a==="new customers")return c.orders===1;if(a==="vip customers")return c.total>=5000||c.orders>=5;if(a.includes("60 days"))return c.last&&((now-new Date(c.last))/86400000)>=60;if(a.includes("90 days"))return c.last&&((now-new Date(c.last))/86400000)>=90;if(a.includes("previous eid buyers"))return false;if(a.includes("previous boishakh buyers"))return false;return true;});
+}
+function marketingPersonalize_(html,campaign,c){return String(html||"").replace(/\{\{name\}\}/gi,htmlEscape_(c.name)).replace(/\{\{email\}\}/gi,htmlEscape_(c.email)).replace(/\{\{coupon\}\}/gi,htmlEscape_(campaign.discountCode||"")).replace(/\{\{campaign\}\}/gi,htmlEscape_(campaign.name||"Peppy Fashion"));}
+function sendMarketingCampaign(data){
+  requireAdmin(data); const campaigns=marketingSheetObjects_("MarketingCampaigns",MARKETING_CAMPAIGN_HEADERS), c=campaigns.find(x=>String(x["Campaign ID"])===String(data.campaignId)); if(!c)throw new Error("Campaign not found.");
+  const campaign=marketingCampaignPublic_(c), recipients=getMarketingCustomers_(campaign.audience), log=getOrCreateMarketingSheet_("MarketingEmailLog",MARKETING_LOG_HEADERS), subject=campaign.subject||campaign.name||"Peppy Fashion Update"; let sent=0,failed=0;
+  recipients.forEach(customer=>{try{MailApp.sendEmail({to:customer.email,subject:subject,htmlBody:marketingPersonalize_(campaign.bodyHtml,campaign,customer)});log.appendRow([new Date(),campaign.campaignId,customer.email,customer.name,"Sent",""]);sent++;}catch(e){log.appendRow([new Date(),campaign.campaignId,customer.email,customer.name,"Failed",e.message]);failed++;}});
+  const row=c.rowNumber; const vals=campaigns.map(x=>x); const sh=getOrCreateMarketingSheet_("MarketingCampaigns",MARKETING_CAMPAIGN_HEADERS); sh.getRange(row,11,1,5).setValues([["Sent",new Date(),new Date(),sent,failed]]);
+  return {message:"Campaign sent.",sent,failed,total:recipients.length};
+}
+function runScheduledMarketingCampaigns(){
+  const campaigns=marketingSheetObjects_("MarketingCampaigns",MARKETING_CAMPAIGN_HEADERS), today=new Date(); campaigns.forEach(c=>{const status=String(c.Status||"").toLowerCase();if(status!=="scheduled")return;const start=c["Start Date"]?new Date(c["Start Date"]):today,end=c["End Date"]?new Date(c["End Date"]):null;if(start>today||(end&&today>end))return;try{sendMarketingCampaign({adminToken:getAdminToken(),campaignId:c["Campaign ID"]});}catch(e){console.error(e);}});
+}
+function setupMarketingAutomation(){
+  const triggers=ScriptApp.getProjectTriggers(); triggers.forEach(t=>{if(t.getHandlerFunction()==="runScheduledMarketingCampaigns")ScriptApp.deleteTrigger(t);});
+  ScriptApp.newTrigger("runScheduledMarketingCampaigns").timeBased().everyHours(1).create();
+  getOrCreateMarketingSheet_("MarketingCampaigns",MARKETING_CAMPAIGN_HEADERS);getOrCreateMarketingSheet_("MarketingEmailLog",MARKETING_LOG_HEADERS);
+  return "Marketing automation trigger installed.";
 }
 
 /* =================================================================
